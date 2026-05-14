@@ -1,13 +1,14 @@
-import postgres from 'postgres';
+import { createClient } from '@supabase/supabase-js';
 import { CrawlSession, Product, Store } from '../types.js';
 
-const connectionString = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ph_price_hunter';
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
-const sql = postgres(connectionString, {
-  max: 10,
-  idle_timeout: 20,
-  connect_timeout: 10,
-});
+if (!supabaseUrl) {
+  throw new Error('Missing SUPABASE_URL environment variable');
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey || '');
 
 export function createCrawlSession(stores: string[]): CrawlSession {
   const now = new Date();
@@ -18,10 +19,15 @@ export function createCrawlSession(stores: string[]): CrawlSession {
     String(now.getMinutes()).padStart(2, '0') +
     String(now.getSeconds()).padStart(2, '0');
 
-  sql`
-    INSERT INTO crawl_sessions (id, started_at, status, stores_crawled)
-    VALUES (${id}, NOW(), 'running', ${stores.join(',')})
-  `.then(() => {}).catch((err: any) => console.error('Failed to create session:', err.message));
+  (async () => {
+    const { error } = await supabase.from('crawl_sessions').insert({
+      id,
+      started_at: now.toISOString(),
+      status: 'running',
+      stores_crawled: stores.join(','),
+    });
+    if (error) console.error('Failed to create session:', error.message);
+  })();
 
   return {
     id, started_at: now.toISOString(), completed_at: null,
@@ -33,111 +39,174 @@ export function createCrawlSession(stores: string[]): CrawlSession {
 export async function updateCrawlSession(
   id: string, status: 'completed' | 'failed', totalProducts: number, totalErrors: number,
 ): Promise<void> {
-  await sql`
-    UPDATE crawl_sessions
-    SET status = ${status}, completed_at = NOW(), total_products = ${totalProducts}, total_errors = ${totalErrors}
-    WHERE id = ${id}
-  `;
+  const { error } = await supabase
+    .from('crawl_sessions')
+    .update({
+      status,
+      completed_at: new Date().toISOString(),
+      total_products: totalProducts,
+      total_errors: totalErrors,
+    })
+    .eq('id', id);
+  if (error) throw error;
 }
 
 export async function getCrawlSessions(limit = 20): Promise<CrawlSession[]> {
-  const rows = await sql`SELECT * FROM crawl_sessions ORDER BY started_at DESC LIMIT ${limit}`;
-  return rows as unknown as CrawlSession[];
+  const { data, error } = await supabase
+    .from('crawl_sessions')
+    .select('*')
+    .order('started_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return (data || []) as unknown as CrawlSession[];
 }
 
 export async function getOrCreateStore(name: string, url?: string): Promise<Store> {
-  const [existing] = await sql`SELECT * FROM stores WHERE name = ${name} LIMIT 1`;
+  const { data: existing } = await supabase
+    .from('stores')
+    .select('*')
+    .eq('name', name)
+    .maybeSingle();
   if (existing) return existing as unknown as Store;
-  const [store] = await sql`
-    INSERT INTO stores (name, url) VALUES (${name}, ${url ?? null}) RETURNING *
-  `;
-  return store as unknown as Store;
+
+  const { data, error } = await supabase
+    .from('stores')
+    .insert({ name, url: url ?? null })
+    .select()
+    .single();
+  if (error) throw error;
+  return data as unknown as Store;
 }
 
 export async function getOrCreateCategory(storeId: number, name: string, url?: string): Promise<number> {
-  const [existing] = await sql`SELECT id FROM categories WHERE store_id = ${storeId} AND name = ${name} LIMIT 1`;
+  const { data: existing } = await supabase
+    .from('categories')
+    .select('id')
+    .eq('store_id', storeId)
+    .eq('name', name)
+    .maybeSingle();
   if (existing) return existing.id;
-  const [cat] = await sql`
-    INSERT INTO categories (store_id, name, url) VALUES (${storeId}, ${name}, ${url ?? null}) RETURNING id
-  `;
-  return cat.id;
+
+  const { data, error } = await supabase
+    .from('categories')
+    .insert({ store_id: storeId, name, url: url ?? null })
+    .select('id')
+    .single();
+  if (error) throw error;
+  return data.id;
 }
 
 export async function upsertProduct(product: Product, crawlSessionId?: string): Promise<number> {
-  const [existing] = await sql`
-    SELECT id, price FROM products
-    WHERE store_id = ${product.store_id}
-      AND sku IS NOT DISTINCT FROM ${product.sku}
-      AND name = ${product.name}
-    LIMIT 1
-  `;
+  let query = supabase
+    .from('products')
+    .select('id, price')
+    .eq('store_id', product.store_id)
+    .eq('name', product.name);
+
+  if (product.sku != null) {
+    query = query.eq('sku', product.sku);
+  } else {
+    query = query.is('sku', null);
+  }
+
+  const { data: existing } = await query.maybeSingle();
 
   const now = new Date().toISOString();
 
   if (existing) {
-    await sql`
-      UPDATE products SET
-        category_id = ${product.category_id},
-        brand = ${product.brand},
-        unit = ${product.unit},
-        price = ${product.price},
-        original_price = ${product.original_price},
-        image_url = ${product.image_url},
-        product_url = ${product.product_url},
-        is_available = true,
-        crawl_session_id = COALESCE(${crawlSessionId ?? null}, crawl_session_id),
-        last_seen_at = ${now},
-        updated_at = NOW()
-      WHERE id = ${existing.id}
-    `;
+    const { error } = await supabase
+      .from('products')
+      .update({
+        category_id: product.category_id,
+        brand: product.brand,
+        unit: product.unit,
+        price: product.price,
+        original_price: product.original_price,
+        image_url: product.image_url,
+        product_url: product.product_url,
+        is_available: true,
+        crawl_session_id: crawlSessionId ?? null,
+        last_seen_at: now,
+        updated_at: now,
+      })
+      .eq('id', existing.id);
+    if (error) throw error;
 
     if (existing.price !== product.price) {
-      await sql`
-        INSERT INTO price_history (product_id, price, original_price, currency)
-        VALUES (${existing.id}, ${product.price}, ${product.original_price}, ${product.currency})
-      `;
+      const { error: histError } = await supabase
+        .from('price_history')
+        .insert({
+          product_id: existing.id,
+          price: product.price,
+          original_price: product.original_price,
+          currency: product.currency,
+        });
+      if (histError) throw histError;
     }
     return existing.id;
   }
 
-  const [newProduct] = await sql`
-    INSERT INTO products (store_id, category_id, name, brand, unit, price, original_price, currency, image_url, product_url, sku, is_available, crawl_session_id, last_seen_at)
-    VALUES (${product.store_id}, ${product.category_id}, ${product.name}, ${product.brand}, ${product.unit},
-      ${product.price}, ${product.original_price}, ${product.currency}, ${product.image_url},
-      ${product.product_url}, ${product.sku}, true,
-      ${crawlSessionId ?? null}, ${now})
-    RETURNING id
-  `;
+  const { data: newProduct, error } = await supabase
+    .from('products')
+    .insert({
+      store_id: product.store_id,
+      category_id: product.category_id,
+      name: product.name,
+      brand: product.brand,
+      unit: product.unit,
+      price: product.price,
+      original_price: product.original_price,
+      currency: product.currency,
+      image_url: product.image_url,
+      product_url: product.product_url,
+      sku: product.sku,
+      is_available: true,
+      crawl_session_id: crawlSessionId ?? null,
+      last_seen_at: now,
+    })
+    .select('id')
+    .single();
+  if (error) throw error;
 
-  await sql`
-    INSERT INTO price_history (product_id, price, original_price, currency)
-    VALUES (${newProduct.id}, ${product.price}, ${product.original_price}, ${product.currency})
-  `;
+  const { error: histError } = await supabase
+    .from('price_history')
+    .insert({
+      product_id: newProduct.id,
+      price: product.price,
+      original_price: product.original_price,
+      currency: product.currency,
+    });
+  if (histError) throw histError;
 
   return newProduct.id;
 }
 
 export async function markProductsNotInSession(crawlSessionId: string, storeIds: number[]): Promise<number> {
-  let count = 0;
+  let total = 0;
   for (const storeId of storeIds) {
-    const result = await sql`
-      UPDATE products SET is_available = false
-      WHERE store_id = ${storeId}
-        AND (crawl_session_id IS NULL OR crawl_session_id != ${crawlSessionId})
-        AND is_available = true
-    `;
-    count += result.count;
+    const { data, error } = await supabase
+      .from('products')
+      .update({ is_available: false })
+      .eq('store_id', storeId)
+      .eq('is_available', true)
+      .or(`crawl_session_id.is.null,crawl_session_id.neq.${crawlSessionId}`)
+      .select('id');
+    if (error) throw error;
+    total += data?.length || 0;
   }
-  return count;
+  return total;
 }
 
 export async function getProductCount(storeId: number): Promise<number> {
-  const [{ count }] = await sql`SELECT COUNT(*)::int as count FROM products WHERE store_id = ${storeId}`;
-  return count;
+  const { count, error } = await supabase
+    .from('products')
+    .select('*', { count: 'exact', head: true })
+    .eq('store_id', storeId);
+  if (error) throw error;
+  return count || 0;
 }
 
 export async function closeDb(): Promise<void> {
-  await sql.end({ timeout: 5 });
 }
 
-export default sql;
+export default supabase;
