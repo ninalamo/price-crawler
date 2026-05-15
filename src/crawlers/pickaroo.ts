@@ -7,6 +7,7 @@ interface PickarooProduct {
   name: string;
   unit: string;
   price: number;
+  originalPrice: number | null;
   imageUrl: string | null;
   sku: string;
 }
@@ -94,7 +95,7 @@ export class PickarooCrawler extends BaseCrawler {
         try {
           const pd = this.makeProduct({
             storeId, categoryId, name: p.name, unit: p.unit,
-            price: p.price, imageUrl: p.imageUrl, productUrl: url,
+            price: p.price, originalPrice: p.originalPrice, imageUrl: p.imageUrl, productUrl: url,
             sku: p.sku,
           });
           await upsertProduct(pd, this.crawlSessionId);
@@ -129,6 +130,7 @@ export class PickarooCrawler extends BaseCrawler {
           if (!name || !price) return;
 
           let unit = '';
+          let originalPrice: number | null = null;
           const card = btn.closest('[class*="item"], [class*="product"], li, div');
           if (card) {
             const allText = (card as HTMLElement).innerText;
@@ -140,12 +142,19 @@ export class PickarooCrawler extends BaseCrawler {
                 unit = next;
               }
             }
+            const priceLine = lines.find(l => /₱\s*[\d,]+/.test(l) && l.includes('₱'));
+            if (priceLine) {
+              const prices = [...priceLine.matchAll(/₱\s*([\d,]+(?:\.\d+)?)/g)].map(m => parseFloat(m[1].replace(/,/g, '')));
+              const higher = prices.find(p => p > price);
+              if (higher) originalPrice = higher;
+            }
           }
 
           products.push({
             name: name.trim(),
             unit: unit || '',
             price,
+            originalPrice,
             imageUrl: photo?.trim() || null,
             sku: `${s}-${b}-${variantId}`,
           });

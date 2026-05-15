@@ -126,7 +126,7 @@ export class Super8Crawler extends BaseCrawler {
         try {
           const pd = this.makeProduct({
             storeId, categoryId, name: p.name, unit: p.unit, price: p.price,
-            imageUrl: p.imageUrl, productUrl: p.productUrl || url, sku: p.sku,
+            originalPrice: p.originalPrice, imageUrl: p.imageUrl, productUrl: p.productUrl || url, sku: p.sku,
           });
           await upsertProduct(pd, this.crawlSessionId);
           result.products.push(pd);
@@ -142,7 +142,7 @@ export class Super8Crawler extends BaseCrawler {
     return result;
   }
 
-  private async extractProducts(page: Page): Promise<{ name: string; unit: string; price: number; imageUrl: string | null; productUrl: string | null; sku: string }[]> {
+  private async extractProducts(page: Page): Promise<{ name: string; unit: string; price: number; originalPrice: number | null; imageUrl: string | null; productUrl: string | null; sku: string }[]> {
     return await page.evaluate(() => {
       const items: any[] = [];
 
@@ -169,10 +169,16 @@ export class Super8Crawler extends BaseCrawler {
 
         if (!name || name.length < 3) return;
 
-        const priceMatch = priceText.match(/₱?([\d,]+(?:\.\d{2})?)/);
-        const price = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : 0;
+        const allPrices = [...priceText.matchAll(/₱?([\d,]+(?:\.\d{2})?)/g)].map(m => parseFloat(m[1].replace(/,/g, '')));
+        const price = allPrices[0] || 0;
+        let originalPrice: number | null = null;
 
         if (!price) return;
+
+        if (allPrices.length > 1) {
+          const higher = allPrices.find(p => p > price);
+          if (higher) originalPrice = higher;
+        }
 
         let unit = '';
         const unitPatterns = [/([\d.]+)\s*(kg|g|ml|l|L|pcs|pack)\b/i];
@@ -185,6 +191,7 @@ export class Super8Crawler extends BaseCrawler {
           name: name.replace(/\s+/g, ' ').trim(),
           unit,
           price,
+          originalPrice,
           imageUrl: img,
           productUrl: link?.startsWith('http') ? link : link ? `https://www.super8.ph${link}` : null,
           sku: `super8-${name.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 50)}-${price}`,
