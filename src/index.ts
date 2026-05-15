@@ -96,6 +96,11 @@ async function main(): Promise<void> {
     console.log(`\n=== ${name} ===`);
     try {
       instance.setSession(session.id);
+      if (name === 'MetroMart' || name === 'Super8') {
+        instance.setThrottle(500);
+      } else {
+        instance.setThrottle(0);
+      }
       await instance.init();
       const results = await instance.crawl();
       await instance.destroy();

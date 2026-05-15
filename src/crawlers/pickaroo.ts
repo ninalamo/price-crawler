@@ -1,6 +1,7 @@
 import { BaseCrawler } from './base.js';
-import { CrawlResult } from '../types.js';
-import { getOrCreateStore, getOrCreateCategory, upsertProduct } from '../db/index.js';
+import { CrawlResult, Product } from '../types.js';
+import { getOrCreateStore, getOrCreateCategory } from '../db/index.js';
+import { batchUpsertProducts } from '../db/batch.js';
 
 interface ApiResponse {
   html: string;
@@ -92,38 +93,39 @@ export class PickarooCrawler extends BaseCrawler {
     const categoryUrl = `${this.baseUrl}/${this.storeSlug}/products/${this.branchSlug}?group=${group}&list=true`;
     const categoryId = await getOrCreateCategory(storeId, categoryName, categoryUrl);
 
+    // Fetch all pages
+    const allProducts: Product[] = [];
     let page = 1;
-    let total = 0;
 
     while (true) {
-      await this.throttle();
       const data = await this.fetchPage(group, page);
       if (!data || !data.html) break;
+      const parsed = this.parseProducts(data.html);
+      if (parsed.length === 0) break;
 
-      const products = this.parseProducts(data.html);
-      if (products.length === 0) break;
-
-      for (const p of products) {
-        try {
-          const pd = this.makeProduct({
-            storeId, categoryId, name: p.name, unit: p.unit,
-            price: p.price, originalPrice: p.originalPrice, imageUrl: p.imageUrl, productUrl: categoryUrl,
-            sku: p.sku,
-          });
-          await upsertProduct(pd, this.crawlSessionId);
-          result.products.push(pd);
-        } catch (err: any) {
-          result.errors.push(`Save "${p.name}": ${err.message}`);
-        }
+      for (const p of parsed) {
+        allProducts.push(this.makeProduct({
+          storeId, categoryId, name: p.name, unit: p.unit,
+          price: p.price, originalPrice: p.originalPrice, imageUrl: p.imageUrl, productUrl: categoryUrl,
+          sku: p.sku,
+        }));
       }
-
-      total += products.length;
 
       if (!data.next) break;
       page = data.next;
     }
 
-    if (total > 0) console.log(`    -> ${total} products`);
+    if (allProducts.length === 0) return result;
+
+    // Batch upsert all products at once
+    try {
+      await batchUpsertProducts(allProducts, this.crawlSessionId);
+      result.products.push(...allProducts);
+    } catch (err: any) {
+      result.errors.push(`Batch upsert failed: ${err.message}`);
+    }
+
+    console.log(`    -> ${result.products.length} products`);
     return result;
   }
 
