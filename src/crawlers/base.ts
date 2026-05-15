@@ -51,12 +51,15 @@ export abstract class BaseCrawler {
     this.browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      timeout: 30000,
     });
   }
 
   async newPage(): Promise<Page> {
     if (!this.browser) throw new Error('Browser not initialized');
     const page = await this.browser.newPage();
+    page.setDefaultTimeout(30000);
+    page.setDefaultNavigationTimeout(30000);
     await page.setViewportSize({ width: 1920, height: 1080 });
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'en-PH,en;q=0.9,fil;q=0.8',

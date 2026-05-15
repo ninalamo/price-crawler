@@ -1,3 +1,5 @@
+process.stdout._handle?.setBlocking(true);
+
 import { SMMarketsCrawler } from './crawlers/sm-markets.js';
 import { PickarooCrawler } from './crawlers/pickaroo.js';
 import { MetroMartCrawler } from './crawlers/metromart.js';
