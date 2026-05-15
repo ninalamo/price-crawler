@@ -13,7 +13,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: price-crawler
+        working-directory: .
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +22,6 @@ jobs:
         with:
           node-version: 22
           cache: 'npm'
-          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -30,9 +29,11 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install chromium
 
+      - name: Create env file
+        run: |
+          "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" | Out-File -FilePath .env -Encoding utf8
+          "SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" | Add-Content -Path .env -Encoding utf8
+          "API_URL=${{ secrets.API_URL }}" | Add-Content -Path .env -Encoding utf8
+
       - name: Run price crawl
         run: npm run crawl
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          API_URL: ${{ secrets.API_URL }}
