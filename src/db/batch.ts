@@ -76,7 +76,7 @@ export async function batchUpsertProducts(
       p.then(resolve, reject);
     });
 
-  // Batch insert new products
+    // Batch insert new products
   if (toInsert.length > 0) {
     for (let i = 0; i < toInsert.length; i += 500) {
       const batch = toInsert.slice(i, i + 500);
