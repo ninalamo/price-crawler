@@ -2,19 +2,36 @@ name: Daily Price Crawl
 
 on:
   schedule:
-    # Run at 19:00 UTC daily = 3:00 AM PHT next day
     - cron: '0 19 * * *'
   workflow_dispatch:
-    # Allow manual trigger from GitHub UI
+    inputs:
+      stores:
+        description: 'Stores (comma-separated: sm,shopwise,robinsons,metromart,super8)'
+        default: 'sm,shopwise,robinsons,metromart,super8'
+        type: string
 
 jobs:
-  crawl:
+  setup:
     runs-on: self-hosted
-    timeout-minutes: 120
+    timeout-minutes: 5
+    outputs:
+      stores: ${{ steps.set-stores.outputs.stores }}
+    steps:
+      - id: set-stores
+        run: |
+          $stores = "${{ github.event.inputs.stores || 'sm,shopwise,robinsons,metromart,super8' }}"
+          $json = ($stores -split ',' | ForEach-Object { """$_""" }) -join ','
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "stores=[$json]"
 
-    defaults:
-      run:
-        working-directory: .
+  crawl:
+    needs: setup
+    strategy:
+      matrix:
+        store: ${{ fromJSON(needs.setup.outputs.stores) }}
+      fail-fast: false
+
+    runs-on: self-hosted
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +47,8 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install chromium
 
-      - name: Run price crawl
-        run: npm run crawl
+      - name: Run crawl (${{ matrix.store }})
+        run: npm run crawl -- --stores ${{ matrix.store }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
