@@ -1,6 +1,5 @@
-process.stdout._handle?.setBlocking(true);
+(process.stdout as any)._handle?.setBlocking(true);
 
-import { SMMarketsCrawler } from './crawlers/sm-markets.js';
 import { PickarooCrawler } from './crawlers/pickaroo.js';
 import { MetroMartCrawler } from './crawlers/metromart.js';
 import { Super8Crawler } from './crawlers/super8.js';
@@ -56,7 +55,10 @@ async function main(): Promise<void> {
   const crawlers: { name: string; instance: BaseCrawler }[] = [];
 
   if (selectedStores.includes('sm')) {
-    crawlers.push({ name: 'SM Savemore', instance: new SMMarketsCrawler(location) });
+    crawlers.push({
+      name: 'SM Savemore',
+      instance: new PickarooCrawler('SM Savemore', 'sm-markets', location),
+    });
   }
   if (selectedStores.includes('shopwise')) {
     crawlers.push({

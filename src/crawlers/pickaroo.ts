@@ -1,7 +1,13 @@
-import { Page } from 'playwright';
 import { BaseCrawler } from './base.js';
 import { CrawlResult } from '../types.js';
 import { getOrCreateStore, getOrCreateCategory, upsertProduct } from '../db/index.js';
+
+interface ApiResponse {
+  html: string;
+  next?: number | null;
+  prev?: string;
+  page?: number;
+}
 
 interface PickarooProduct {
   name: string;
@@ -26,76 +32,82 @@ export class PickarooCrawler extends BaseCrawler {
     return `${this.storeName} (${this.branchSlug})`;
   }
 
+  async init(): Promise<void> {
+    // no Playwright needed
+  }
+
+  async destroy(): Promise<void> {
+    // no Playwright needed
+  }
+
   async crawl(): Promise<CrawlResult[]> {
     const results: CrawlResult[] = [];
     const store = await getOrCreateStore(this.storeName, this.baseUrl);
     const storeId = store.id;
 
-    const page = await this.newPage();
-    try {
-      const rootUrl = `${this.baseUrl}/${this.storeSlug}/products/${this.branchSlug}`;
-      console.log(`  [${this.storeName}] Loading page to discover categories...`);
-      await this.throttle();
-      await page.goto(rootUrl, { waitUntil: 'networkidle', timeout: 30000 });
-      await page.waitForTimeout(2000);
+    const categories = await this.discoverCategories();
+    if (categories.length === 0) {
+      console.log(`  [${this.storeName}] No categories found`);
+      return results;
+    }
 
-      const categories = await page.evaluate(() => {
-        const links = document.querySelectorAll('a.menu-item, a[href*="group="]');
-        const seen = new Set<string>();
-        return Array.from(links)
-          .map(a => ({
-            name: a.textContent?.trim() || '',
-            href: a.getAttribute('href') || '',
-          }))
-          .filter(l => {
-            const match = l.href.match(/[?&]group=([^&]+)/);
-            const key = match?.[1] || '';
-            if (!key || seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-      });
+    console.log(`  [${this.storeName}] Found ${categories.length} categories`);
 
-      console.log(`  [${this.storeName}] Found ${categories.length} categories`);
-
-      for (const cat of categories) {
-        const url = `${this.baseUrl}${cat.href.startsWith('/') ? '' : '/'}${cat.href}`;
-        console.log(`  [${this.storeName}] ${cat.name}...`);
-        const result = await this.crawlCategory(page, storeId, cat.name, url);
-        results.push(result);
-      }
-
-      if (categories.length === 0) {
-        console.log(`  [${this.storeName}] No categories found. Trying direct extraction...`);
-        const result = await this.crawlCategory(page, storeId, 'all', rootUrl);
-        results.push(result);
-      }
-
-    } finally {
-      await page.close();
+    for (const cat of categories) {
+      console.log(`  [${this.storeName}] ${cat.name}...`);
+      const result = await this.crawlCategory(storeId, cat.name, cat.group);
+      results.push(result);
     }
 
     return results;
   }
 
+  private async discoverCategories(): Promise<{ name: string; group: string }[]> {
+    const baseUrl = `${this.baseUrl}/${this.storeSlug}/products/${this.branchSlug}`;
+    const resp = await fetch(baseUrl, {
+      headers: { 'Accept-Language': 'en-PH,en;q=0.9,fil;q=0.8' },
+    });
+    const html = await resp.text();
+
+    const categories: { name: string; group: string }[] = [];
+    const seen = new Set<string>();
+    const linkRegex = /<a[\s\S]*?\?group=([^"&]+)[^"]*list=true[^"]*"[\s\S]*?<\/a>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = linkRegex.exec(html)) !== null) {
+      const group = match[1];
+      if (seen.has(group)) continue;
+      seen.add(group);
+      const name = match[0].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').trim();
+      if (!name || name.length > 50) continue;
+      categories.push({ name, group });
+    }
+
+    return categories;
+  }
+
   private async crawlCategory(
-    page: Page, storeId: number, categoryName: string, url: string,
+    storeId: number, categoryName: string, group: string,
   ): Promise<CrawlResult> {
     const result: CrawlResult = { store: this.storePrettyName, category: categoryName, products: [], errors: [] };
+    const categoryUrl = `${this.baseUrl}/${this.storeSlug}/products/${this.branchSlug}?group=${group}&list=true`;
+    const categoryId = await getOrCreateCategory(storeId, categoryName, categoryUrl);
 
-    try {
+    let page = 1;
+    let total = 0;
+
+    while (true) {
       await this.throttle();
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-      await page.waitForTimeout(2000);
+      const data = await this.fetchPage(group, page);
+      if (!data || !data.html) break;
 
-      const products = await this.extractProducts(page);
-      const categoryId = await getOrCreateCategory(storeId, categoryName, url);
+      const products = this.parseProducts(data.html);
+      if (products.length === 0) break;
 
       for (const p of products) {
         try {
           const pd = this.makeProduct({
             storeId, categoryId, name: p.name, unit: p.unit,
-            price: p.price, originalPrice: p.originalPrice, imageUrl: p.imageUrl, productUrl: url,
+            price: p.price, originalPrice: p.originalPrice, imageUrl: p.imageUrl, productUrl: categoryUrl,
             sku: p.sku,
           });
           await upsertProduct(pd, this.crawlSessionId);
@@ -104,65 +116,75 @@ export class PickarooCrawler extends BaseCrawler {
           result.errors.push(`Save "${p.name}": ${err.message}`);
         }
       }
-      console.log(`    -> ${products.length} products`);
-    } catch (err: any) {
-      result.errors.push(`Category "${categoryName}": ${err.message}`);
+
+      total += products.length;
+
+      if (!data.next) break;
+      page = data.next;
     }
 
+    if (total > 0) console.log(`    -> ${total} products`);
     return result;
   }
 
-  private async extractProducts(page: Page): Promise<PickarooProduct[]> {
-    const branch = this.branchSlug;
-    const slug = this.storeSlug;
-    return await page.evaluate(
-      ({ branch: b, slug: s }: { branch: string; slug: string }) => {
-        const products: any[] = [];
-        const buttons = document.querySelectorAll('button.add-to-cart-button');
+  private async fetchPage(group: string, page: number): Promise<ApiResponse | null> {
+    try {
+      const url = `${this.baseUrl}/${this.storeSlug}/products/${this.branchSlug}/search-inventories?group=${group}&page=${page}`;
+      const resp = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept-Language': 'en-PH,en;q=0.9,fil;q=0.8',
+        },
+      });
+      if (!resp.ok) return null;
+      return await resp.json();
+    } catch {
+      return null;
+    }
+  }
 
-        buttons.forEach((btn) => {
-          const name = btn.getAttribute('data-variant-name') || '';
-          const variantId = btn.getAttribute('data-variant-id') || '';
-          const photo = btn.getAttribute('data-variant-photo') || '';
-          const priceStr = (btn.getAttribute('data-price') || '').trim();
-          const price = parseFloat(priceStr);
+  private parseProducts(html: string): PickarooProduct[] {
+    const products: PickarooProduct[] = [];
+    const cardStarts = html.split('<div class="three columns new_columns two_column_mobile inventory-card"');
+    for (let i = 1; i < cardStarts.length; i++) {
+      const chunk = cardStarts[i];
+      const invMatch = chunk.match(/data-inventory-id="(\d+)"/);
+      const inventoryId = invMatch ? invMatch[1] : '';
+      if (!inventoryId) continue;
 
-          if (!name || !price) return;
+      let name = '', unit = '', price = 0, imageUrl: string | null = null;
 
-          let unit = '';
-          let originalPrice: number | null = null;
-          const card = btn.closest('[class*="item"], [class*="product"], li, div');
-          if (card) {
-            const allText = (card as HTMLElement).innerText;
-            const lines = allText.split('\n').map(l => l.trim()).filter(Boolean);
-            const nameIdx = lines.findIndex(l => l === name);
-            if (nameIdx >= 0 && nameIdx + 1 < lines.length) {
-              const next = lines[nameIdx + 1];
-              if (/^~?\s*\d/.test(next)) {
-                unit = next;
-              }
-            }
-            const priceLine = lines.find(l => /₱\s*[\d,]+/.test(l) && l.includes('₱'));
-            if (priceLine) {
-              const prices = [...priceLine.matchAll(/₱\s*([\d,]+(?:\.\d+)?)/g)].map(m => parseFloat(m[1].replace(/,/g, '')));
-              const higher = prices.find(p => p > price);
-              if (higher) originalPrice = higher;
-            }
-          }
+      const nameMatch = chunk.match(/data-variant-name="([^"]*)"/);
+      if (nameMatch) name = nameMatch[1].trim();
 
-          products.push({
-            name: name.trim(),
-            unit: unit || '',
-            price,
-            originalPrice,
-            imageUrl: photo?.trim() || null,
-            sku: `${s}-${b}-${variantId}`,
-          });
-        });
+      if (!name) {
+        const nameSpan = chunk.match(/<span class="name">([\s\S]*?)<\/span>/);
+        if (nameSpan) name = nameSpan[1].trim();
+      }
+      if (!name) continue;
 
-        return products;
-      },
-      { branch, slug }
-    );
+      const unitMatch = chunk.match(/<span class="desc">([\s\S]*?)<\/span>/);
+      if (unitMatch) unit = unitMatch[1].trim();
+
+      const priceMatch = chunk.match(/data-price="\s*([\d,.]+)\s*"/);
+      if (priceMatch) price = parseFloat(priceMatch[1].replace(/,/g, ''));
+
+      if (!price) {
+        const priceSpan = chunk.match(/₱\s*([\d,]+(?:\.\d+)?)/);
+        if (priceSpan) price = parseFloat(priceSpan[1].replace(/,/g, ''));
+      }
+
+      const photoMatch = chunk.match(/data-variant-photo="\s*([^"]*)\s*"/);
+      if (photoMatch) imageUrl = photoMatch[1].trim() || null;
+
+      const variantIdMatch = chunk.match(/data-variant-id="([^"]+)"/);
+      const variantId = variantIdMatch ? variantIdMatch[1] : inventoryId;
+      const sku = `${this.storeSlug}-${this.branchSlug}-${variantId}`;
+
+      products.push({ name, unit, price, originalPrice: null, imageUrl, sku });
+    }
+
+    return products;
   }
 }
